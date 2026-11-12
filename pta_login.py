@@ -37,6 +37,46 @@ JS_CHECK = """
 }
 """
 
+# 检查登录表单是否已渲染
+JS_HAS_FORM = """
+() => {
+  const inputs = document.querySelectorAll('input');
+  let hasText = false, hasPwd = false;
+  for (const i of inputs) {
+    const r = i.getBoundingClientRect();
+    if (r.width < 5 || r.height < 5) continue;
+    if (i.type === 'text' || i.type === 'email' || i.type === 'tel') hasText = true;
+    if (i.type === 'password') hasPwd = true;
+  }
+  const btns = Array.from(document.querySelectorAll('button'))
+    .filter(b => {
+      const r = b.getBoundingClientRect();
+      return r.width > 5 && (b.innerText||'').trim() === '登录';
+    });
+  return { ready: hasText && hasPwd, hasText, hasPwd, hasBtn: btns.length > 0,
+           url: location.href, title: document.title };
+}
+"""
+
+
+async def wait_for_login_form(cdp, timeout=25):
+    """轮询等待登录表单渲染出来"""
+    import time as _t
+    t0 = _t.time()
+    last = None
+    while _t.time() - t0 < timeout:
+        try:
+            st = await cdp.js(JS_HAS_FORM)
+            last = st
+            if isinstance(st, dict) and st.get("ready"):
+                # 再多等一点，等 React 挂完事件
+                await asyncio.sleep(0.6)
+                return True, st
+        except Exception:
+            pass
+        await asyncio.sleep(0.5)
+    return False, last
+
 # 自动填表并提交（React 受控组件正确写法）
 JS_FILL = """
 (args) => {
@@ -55,15 +95,28 @@ JS_FILL = """
     el.dispatchEvent(new Event('change', { bubbles: true }));
   }
 
-  // 找账号框
-  const inputs = Array.from(document.querySelectorAll('input'));
-  const accInput = inputs.find(i =>
-    i.type === 'text' || i.type === 'email' || i.type === 'tel'
-  );
-  const pwdInput = inputs.find(i => i.type === 'password');
+  // 找账号框：优先 placeholder 匹配，再退回 type
+  const visible = Array.from(document.querySelectorAll('input')).filter(i => {
+    const r = i.getBoundingClientRect();
+    return r.width > 5 && r.height > 5;
+  });
+
+  let accInput = visible.find(i => /邮箱|手机|账号|email|phone|account/i.test(i.placeholder || ''));
+  if (!accInput) {
+    accInput = visible.find(i => ['text', 'email', 'tel'].includes(i.type));
+  }
+
+  let pwdInput = visible.find(i => i.type === 'password');
+  if (!pwdInput) {
+    pwdInput = visible.find(i => /密码|password/i.test(i.placeholder || ''));
+  }
 
   if (!accInput || !pwdInput) {
-    return { ok: false, reason: '找不到账号或密码输入框', count: inputs.length };
+    return {
+      ok: false,
+      reason: '找不到账号或密码输入框',
+      found: visible.map(i => ({ type: i.type, ph: i.placeholder || '' }))
+    };
   }
 
   setNativeValue(accInput, account);
@@ -73,7 +126,7 @@ JS_FILL = """
   const btns = Array.from(document.querySelectorAll('button'));
   const loginBtn = btns.find(b => {
     const t = (b.innerText || '').trim();
-    return t === '登录' || /^登\s*录$/.test(t);
+    return t === '登录' || /^登\\s*录$/.test(t);
   });
 
   if (!loginBtn) {
@@ -135,15 +188,24 @@ async def auto_login(cdp, account, password, captcha_wait=90):
     返回 {ok, reason, userId}
     """
     print("  打开登录页…")
-    await cdp.goto(LOGIN_URL, wait=6)
+    await cdp.goto(LOGIN_URL, wait=3)
 
-    # 检查是否已经在登录页
-    try:
-        r = await cdp.js(JS_CHECK)
-        if r and r.get("logged"):
-            return {"ok": True, "reason": "已经登录", "userId": r.get("userId")}
-    except Exception:
-        pass
+    # 等表单真正渲染出来（最多 25 秒）
+    print("  等待登录表单加载…")
+    ready, st = await wait_for_login_form(cdp, timeout=25)
+
+    if not ready:
+        # 可能是已经登录了被重定向走
+        try:
+            r = await cdp.js(JS_CHECK)
+            if r and r.get("logged"):
+                return {"ok": True, "reason": "已经登录", "userId": r.get("userId")}
+        except Exception:
+            pass
+        detail = ""
+        if isinstance(st, dict):
+            detail = f"（url={st.get('url','?')[:50]} 有账号框={st.get('hasText')} 有密码框={st.get('hasPwd')}）"
+        return {"ok": False, "reason": f"登录表单没加载出来{detail}"}
 
     # 填表
     print("  填写账号密码…")
@@ -153,7 +215,14 @@ async def auto_login(cdp, account, password, captcha_wait=90):
         return {"ok": False, "reason": f"填表异常: {e}"}
 
     if not (isinstance(fill, dict) and fill.get("ok")):
-        return {"ok": False, "reason": (fill or {}).get("reason", "填表失败")}
+        # 填表失败，重试一次（可能 React 刚挂载）
+        await asyncio.sleep(1.5)
+        try:
+            fill = await cdp.js(JS_FILL, {"account": account, "password": password})
+        except Exception as e:
+            return {"ok": False, "reason": f"填表异常: {e}"}
+        if not (isinstance(fill, dict) and fill.get("ok")):
+            return {"ok": False, "reason": (fill or {}).get("reason", "填表失败")}
 
     print(f"  已填写（账号:{fill.get('accountFilled')} 密码:{fill.get('passwordFilled')}）")
     print("  已点击登录，等待响应…")
